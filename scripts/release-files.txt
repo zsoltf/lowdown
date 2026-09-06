@@ -1,0 +1,8 @@
+LICENSE
+docs/index.md
+docs/install.md
+docs/quickstart.md
+docs/input-contract.md
+docs/releases/0.1.0.md
+docs/ops/releasing.md
+docs/ops/macos-signing.md

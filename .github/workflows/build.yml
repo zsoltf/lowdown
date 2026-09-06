@@ -1,0 +1,151 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      LOWDOWN_SUMMARY_PROVIDER: fallback
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6, Node 24
+        with:
+          persist-credentials: false
+      - name: Check repository hygiene
+        shell: bash
+        run: |
+          private_files="$(git ls-files -- '.agent/**' '.codex/**' '.claude/**' '.gemini/**' '[Aa][Gg][Ee][Nn][Tt][Ss].md' '[Ll][Ee][Aa][Rr][Nn][Ii][Nn][Gg][Ss].md' '[Cc][Ll][Aa][Uu][Dd][Ee].md' '[Gg][Ee][Mm][Ii][Nn][Ii].md' 'docs/workflow/**' 'docs/design/**' 'docs/adr/**' 'docs/ops/agent-lab-proving.md' 'docs/ops/host-runtime.md' 'docs/ops/oracle-advisory.md' 'docs/ops/production-engineering-standard.md')"
+          if [[ -n "$private_files" ]]; then
+            printf 'Local-only files must not be tracked:\n%s\n' "$private_files"
+            exit 1
+          fi
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Format
+        run: cargo +stable fmt --check
+      - name: Lint
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - name: Test offline behavior
+        run: cargo +stable test --locked
+      - name: Install dependency auditor
+        if: runner.os == 'Linux'
+        run: cargo +stable install cargo-audit --version 0.22.2 --locked
+      - name: Audit locked dependencies
+        if: runner.os == 'Linux'
+        run: cargo +stable audit --deny warnings
+      - name: Build release binary
+        run: cargo +stable build --locked --release --bin lowdown --target ${{ matrix.target }}
+      - name: Package and smoke test (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s scripts -p 'test_*.py'
+          export LOWDOWN_SUMMARY_PROVIDER=fallback
+          export LOWDOWN_CACHE_DIR="$PWD/target/package-smoke-cache"
+          binary="target/$TARGET/release/lowdown"
+          version="$($binary --version | cut -d ' ' -f 2)"
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            exit 1
+          fi
+          name="lowdown-$version-$TARGET"
+          mkdir -p "dist/$name"
+          cp "$binary" "dist/$name/"
+          while IFS= read -r file; do
+            mkdir -p "dist/$name/$(dirname "$file")"
+            cp "$file" "dist/$name/$file"
+          done < scripts/release-files.txt
+          COPYFILE_DISABLE=1 tar --no-xattrs -czf "dist/$name.tar.gz" -C dist "$name"
+          python3 scripts/check_archive.py "dist/$name.tar.gz" "$name"
+          mkdir -p target/package-smoke
+          tar -xzf "dist/$name.tar.gz" -C target/package-smoke
+          "target/package-smoke/$name/lowdown" --version
+          "target/package-smoke/$name/lowdown" digest --session tests/fixtures/sample_rollout.jsonl --pretty
+          while IFS= read -r file; do
+            cmp "$file" "target/package-smoke/$name/$file"
+          done < scripts/release-files.txt
+          { printf 'lowdown\n'; cat scripts/release-files.txt; } | LC_ALL=C sort > target/package-smoke/expected.txt
+          find "target/package-smoke/$name" ! -type d | sed "s|^target/package-smoke/$name/||" | LC_ALL=C sort > target/package-smoke/actual.txt
+          diff -u target/package-smoke/expected.txt target/package-smoke/actual.txt
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          else
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+      - name: Package and smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:LOWDOWN_SUMMARY_PROVIDER = 'fallback'
+          $env:LOWDOWN_CACHE_DIR = "$PWD/target/package-smoke-cache"
+          $binary = "target/$env:TARGET/release/lowdown.exe"
+          $version = ((& $binary --version) -split ' ')[1]
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") { exit 1 }
+          $name = "lowdown-$version-$env:TARGET"
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          Copy-Item $binary "dist/$name/"
+          foreach ($file in Get-Content scripts/release-files.txt) {
+            $destination = "dist/$name/$file"
+            New-Item -ItemType Directory -Force (Split-Path $destination) | Out-Null
+            Copy-Item $file $destination
+          }
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          Expand-Archive "dist/$name.zip" -DestinationPath target/package-smoke
+          & "target/package-smoke/$name/lowdown.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "target/package-smoke/$name/lowdown.exe" digest --session tests/fixtures/sample_rollout.jsonl --pretty
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($file in Get-Content scripts/release-files.txt) {
+            if ((Get-FileHash $file).Hash -ne (Get-FileHash "target/package-smoke/$name/$file").Hash) {
+              throw "Packaged file differs: $file"
+            }
+          }
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          $prefix = (Resolve-Path "target/package-smoke/$name").Path + [IO.Path]::DirectorySeparatorChar
+          $actual = @(Get-ChildItem "target/package-smoke/$name" -Recurse -File | ForEach-Object {
+            $_.FullName.Substring($prefix.Length).Replace('\', '/')
+          })
+          $expected = @('lowdown.exe') + @(Get-Content scripts/release-files.txt)
+          if (Compare-Object ($expected | Sort-Object) ($actual | Sort-Object)) {
+            throw 'Archive contains missing or unexpected payload files'
+          }
+          [IO.File]::WriteAllText("$PWD/dist/$name.zip.sha256", "$hash  $name.zip`n", [Text.Encoding]::ASCII)
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6, Node 24
+        with:
+          name: lowdown-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
