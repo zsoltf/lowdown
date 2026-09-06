@@ -55,8 +55,16 @@ them or ZIP files. Archive-based CLI distribution therefore needs an online
 Gatekeeper lookup. Do not claim offline trust, run `stapler` on the bare binary,
 or disable Gatekeeper. A stapled DMG/PKG would be a separate distribution choice.
 
-Verify the final download on a clean Mac with quarantine intact, including first
-launch and `spctl --assess --type execute --verbose=4` against the executable.
-Local `codesign --verify` alone does not prove that download experience.
+Check the notarization ticket for the standalone executable:
+
+```sh
+codesign -vvvv -R=notarized --check-notarization "$package/lowdown"
+```
+
+Do not use the app-specific `spctl --type execute` assessment for this bare CLI;
+it can reject valid code because it is not an app bundle. Then verify the final
+download on a clean Mac with quarantine intact, including first launch with
+network access. A local signature or ticket check does not prove that download
+experience. See [Apple's product testing guidance](https://developer.apple.com/forums/thread/130560).
 
 Reference: [Apple's notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
