@@ -86,6 +86,7 @@ jobs:
           tar -xzf "dist/$name.tar.gz" -C target/package-smoke
           "target/package-smoke/$name/lowdown" --version
           "target/package-smoke/$name/lowdown" digest --session tests/fixtures/sample_rollout.jsonl --pretty
+          LOWDOWN_TEST_BINARY="$PWD/target/package-smoke/$name/lowdown" cargo +stable test --locked --test terminal -- --nocapture
           while IFS= read -r file; do
             cmp "$file" "target/package-smoke/$name/$file"
           done < scripts/release-files.txt
@@ -124,6 +125,9 @@ jobs:
           & "target/package-smoke/$name/lowdown.exe" --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "target/package-smoke/$name/lowdown.exe" digest --session tests/fixtures/sample_rollout.jsonl --pretty
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:LOWDOWN_TEST_BINARY = "$PWD/target/package-smoke/$name/lowdown.exe"
+          cargo +stable test --locked --test terminal -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           foreach ($file in Get-Content scripts/release-files.txt) {
             if ((Get-FileHash $file).Hash -ne (Get-FileHash "target/package-smoke/$name/$file").Hash) {

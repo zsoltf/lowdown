@@ -29,6 +29,8 @@ unicode-width = "0.2"
 textwrap = "0.16"
 
 [dev-dependencies]
+portable-pty = "0.9"
+vt100 = "0.15"
 
 [profile.release]
 lto = "thin"

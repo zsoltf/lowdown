@@ -19,6 +19,22 @@ wait for model completion. Use a fake model process for this regression, not
 subscription credentials. Exercise sustained appends and history loading and
 record latency/resource observations; do not call a short smoke a soak test.
 
+`cargo test --locked --test terminal -- --nocapture` opens the real binary in
+a native pseudo-terminal (ConPTY on Windows), decodes its screen, and checks
+startup, navigation, paged readers, wrapping, resize, older-history loading,
+live appends, and terminal restoration. Synthetic sessions, isolated caches,
+and forced fallback keep it offline. It fails rather than skips if raw mode
+cannot start. The CI packaging steps repeat it against the extracted binary.
+Set `LOWDOWN_TEST_BINARY` to an absolute extracted executable path to do that
+locally. `LOWDOWN_TEST_STREAM_SECONDS=120` extends the append/navigation loop;
+the default is twelve appends, and the maximum is ten minutes. Measure resources
+separately; a short automated run is not proof of hours-long reliability.
+
+Run terminal checks on native release hosts. A translated x86-64 Docker guest
+on Apple Silicon can reject the terminal library's `TCGETS2` ioctl with ENOSYS
+while the older `TCGETS` works. That result neither passes nor disproves native
+Linux support; retain the failure and require the native-host check.
+
 The GitHub build workflow checks macOS Apple Silicon and Intel, Linux x86-64
 (Ubuntu 22.04), and Windows x86-64. It packages the tested binary, license and
 operator docs, then smoke-tests the extracted archive. Archives include SHA-256
