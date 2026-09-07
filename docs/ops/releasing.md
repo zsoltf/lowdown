@@ -30,6 +30,13 @@ locally. `LOWDOWN_TEST_STREAM_SECONDS=120` extends the append/navigation loop;
 the default is twelve appends, and the maximum is ten minutes. Measure resources
 separately; a short automated run is not proof of hours-long reliability.
 
+The harness answers ConPTY cursor-position requests on its background I/O
+thread, including during startup and teardown. Stage diagnostics are printed
+even when test output is captured. A watchdog fails the test process after
+two minutes plus the requested streaming duration, with at most two additional
+seconds for child termination. A deadline failure is not a passing test; fix
+the reported stalled stage rather than increasing the CI job limit.
+
 Run terminal checks on native release hosts. A translated x86-64 Docker guest
 on Apple Silicon can reject the terminal library's `TCGETS2` ioctl with ENOSYS
 while the older `TCGETS` works. That result neither passes nor disproves native

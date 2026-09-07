@@ -1,27 +1,146 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde_json::json;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-struct Terminal {
-    child: Box<dyn Child + Send + Sync>,
-    master: Option<Box<dyn MasterPty + Send>>,
-    writer: Option<Box<dyn Write + Send>>,
-    reader: Option<JoinHandle<()>>,
-    output: Receiver<Vec<u8>>,
+enum WatchEvent {
+    Stage(String),
+    Child(Box<dyn ChildKiller + Send + Sync>),
+    ChildExited,
+    Done,
+}
+
+struct Watchdog {
+    events: Sender<WatchEvent>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Watchdog {
+    fn start(budget: Duration) -> Self {
+        let (events, rx) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let deadline = Instant::now() + budget;
+            let mut stage = String::from("setup");
+            let mut killer: Option<Box<dyn ChildKiller + Send + Sync>> = None;
+            loop {
+                let event = if Instant::now() >= deadline {
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                } else {
+                    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                };
+                match event {
+                    Ok(WatchEvent::Stage(next)) => stage = next,
+                    Ok(WatchEvent::Child(child)) => killer = Some(child),
+                    Ok(WatchEvent::ChildExited) => killer = None,
+                    Ok(WatchEvent::Done) => return,
+                    Err(_) => {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "Terminal test hard deadline ({budget:?}) exceeded during {stage}"
+                        );
+                        if let Some(mut killer) = killer {
+                            let (tx, rx) = mpsc::channel();
+                            thread::spawn(move || {
+                                let _ = tx.send(killer.kill());
+                            });
+                            // Even a stuck OS cleanup call must not defeat the deadline.
+                            let _ = rx.recv_timeout(Duration::from_secs(2));
+                        }
+                        std::process::exit(124);
+                    }
+                }
+            }
+        });
+        Self {
+            events,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        let _ = self.events.send(WatchEvent::Done);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn stage(events: &Sender<WatchEvent>, label: &str) {
+    let _ = events.send(WatchEvent::Stage(label.into()));
+    // Bypass libtest's capture so a native deadlock leaves its last stage in CI.
+    let _ = writeln!(std::io::stderr(), "Terminal stage: {label}");
+}
+
+#[derive(Default)]
+struct CursorQuery(bool);
+
+impl vte::Perform for CursorQuery {
+    fn csi_dispatch(
+        &mut self,
+        params: &vte::Params,
+        intermediates: &[u8],
+        ignore: bool,
+        action: char,
+    ) {
+        self.0 =
+            !ignore && intermediates.is_empty() && action == 'n' && params.iter().eq([&[6u16][..]]);
+    }
+}
+
+struct TerminalScreen {
     parser: vt100::Parser,
+    queries: vte::Parser,
+}
+
+impl TerminalScreen {
+    fn new() -> Self {
+        Self {
+            parser: vt100::Parser::new(32, 100, 0),
+            queries: vte::Parser::new(),
+        }
+    }
+
+    fn process(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut replies = Vec::new();
+        for byte in bytes {
+            self.parser.process(std::slice::from_ref(byte));
+            let mut query = CursorQuery::default();
+            self.queries.advance(&mut query, *byte);
+            if query.0 {
+                let (row, col) = self.parser.screen().cursor_position();
+                write!(replies, "\x1b[{};{}R", row + 1, col + 1).unwrap();
+            }
+        }
+        replies
+    }
+}
+
+type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
+struct Terminal {
+    child: Option<Box<dyn Child + Send + Sync>>,
+    master: Option<Box<dyn MasterPty + Send>>,
+    writer: Option<SharedWriter>,
+    reader: Option<JoinHandle<()>>,
+    output: Receiver<()>,
+    screen: Arc<Mutex<TerminalScreen>>,
+    events: Sender<WatchEvent>,
     exited: bool,
 }
 
 impl Terminal {
-    fn open(session: &Path, cache: &Path) -> Self {
+    fn open(session: &Path, cache: &Path, watchdog: &Watchdog) -> Self {
+        stage(&watchdog.events, "create PTY");
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 32,
@@ -38,53 +157,76 @@ impl Terminal {
         command.env("LOWDOWN_CACHE_DIR", cache);
         command.env("CODEX_HOME", cache.join("codex"));
         command.env("TERM", "xterm-256color");
-        let writer = pair.master.take_writer().unwrap();
+        let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
         let mut input = pair.master.try_clone_reader().unwrap();
-        let child = pair.slave.spawn_command(command).unwrap();
-        drop(pair.slave);
         let (tx, output) = mpsc::channel();
+        let screen = Arc::new(Mutex::new(TerminalScreen::new()));
+        let reader_screen = Arc::clone(&screen);
+        let reply_writer = Arc::clone(&writer);
+        // ConPTY can request the inherited cursor before spawn, during resize,
+        // or during close. Service it independently of the test's control loop.
         let reader = thread::spawn(move || {
             let mut buffer = [0; 8192];
             loop {
                 match input.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(count) => {
-                        if tx.send(buffer[..count].to_vec()).is_err() {
+                        let replies = reader_screen.lock().unwrap().process(&buffer[..count]);
+                        if !replies.is_empty() {
+                            let mut writer = reply_writer.lock().unwrap();
+                            if writer
+                                .write_all(&replies)
+                                .and_then(|()| writer.flush())
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        if tx.send(()).is_err() {
                             break;
                         }
                     }
                 }
             }
         });
-        Self {
-            child,
+        let mut terminal = Self {
+            child: None,
             master: Some(pair.master),
             writer: Some(writer),
             reader: Some(reader),
             output,
-            parser: vt100::Parser::new(32, 100, 0),
+            screen,
+            events: watchdog.events.clone(),
             exited: false,
-        }
+        };
+        stage(&terminal.events, "spawn child");
+        let child = pair.slave.spawn_command(command);
+        drop(pair.slave);
+        terminal.child = Some(child.unwrap());
+        let _ = terminal.events.send(WatchEvent::Child(
+            terminal.child.as_ref().unwrap().clone_killer(),
+        ));
+        terminal
     }
 
     fn pump(&mut self) {
-        if let Ok(bytes) = self.output.recv_timeout(Duration::from_millis(20)) {
-            self.parser.process(&bytes);
-        }
+        let _ = self.output.recv_timeout(Duration::from_millis(20));
     }
 
     fn until(&mut self, label: &str, predicate: impl Fn(&str) -> bool) -> String {
+        stage(&self.events, label);
         let deadline = Instant::now() + TIMEOUT;
         loop {
             self.pump();
-            let screen = self.parser.screen().contents();
+            let screen = self.screen.lock().unwrap().parser.screen().contents();
             if predicate(&screen) {
                 return screen;
             }
-            assert!(
-                self.child.try_wait().unwrap().is_none(),
-                "Child exited during {label}:\n{screen}"
-            );
+            if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
+                self.exited = true;
+                let _ = self.events.send(WatchEvent::ChildExited);
+                panic!("Child exited ({status}) during {label}:\n{screen}");
+            }
             assert!(
                 Instant::now() < deadline,
                 "Timed out during {label}:\n{screen}"
@@ -93,13 +235,15 @@ impl Terminal {
     }
 
     fn send(&mut self, keys: &[u8]) {
-        let writer = self.writer.as_mut().unwrap();
+        stage(&self.events, "send input");
+        let mut writer = self.writer.as_ref().unwrap().lock().unwrap();
         writer.write_all(keys).unwrap();
         writer.flush().unwrap();
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
-        self.parser.set_size(rows, cols);
+        stage(&self.events, &format!("resize {cols}x{rows}"));
+        self.screen.lock().unwrap().parser.set_size(rows, cols);
         self.master
             .as_ref()
             .unwrap()
@@ -113,37 +257,44 @@ impl Terminal {
 
     fn quit(&mut self) {
         self.send(b"q");
+        stage(&self.events, "quit and restore terminal");
         let deadline = Instant::now() + TIMEOUT;
         loop {
             self.pump();
-            if let Some(status) = self.child.try_wait().unwrap() {
+            if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
                 self.exited = true;
+                let _ = self.events.send(WatchEvent::ChildExited);
                 assert!(status.success(), "Unclean quit: {status}");
                 break;
             }
             assert!(Instant::now() < deadline, "Quit blocked");
         }
-        while (self.parser.screen().alternate_screen() || self.parser.screen().hide_cursor())
-            && Instant::now() < deadline
-        {
+        while !self.restored() && Instant::now() < deadline {
             self.pump();
         }
-        assert!(
-            !self.parser.screen().alternate_screen(),
-            "Alternate screen not restored"
-        );
-        assert!(!self.parser.screen().hide_cursor(), "Cursor not restored");
+        assert!(self.restored(), "Alternate screen or cursor not restored");
+    }
+
+    fn restored(&self) -> bool {
+        let screen = self.screen.lock().unwrap();
+        !screen.parser.screen().alternate_screen() && !screen.parser.screen().hide_cursor()
     }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        if !self.exited {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        stage(&self.events, "reap child");
+        if !self.exited
+            && let Some(child) = self.child.as_mut()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        self.writer.take();
+        let _ = self.events.send(WatchEvent::ChildExited);
+        stage(&self.events, "close PTY (background replies still active)");
         self.master.take();
+        self.writer.take();
+        stage(&self.events, "join PTY reader");
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -188,7 +339,116 @@ fn loaded(screen: &str) -> usize {
 }
 
 #[test]
+fn cursor_queries_reply_at_the_current_position_across_read_boundaries() {
+    let bytes = b"\x1b[6n\x1b[4;12H\x1b[6nhello\x1b[6n";
+    for chunk_size in 1..=bytes.len() {
+        let mut screen = TerminalScreen::new();
+        let mut replies = Vec::new();
+        for chunk in bytes.chunks(chunk_size) {
+            replies.extend(screen.process(chunk));
+        }
+        assert_eq!(
+            replies, b"\x1b[1;1R\x1b[4;12R\x1b[4;17R",
+            "chunks of {chunk_size}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_text_and_other_controls_do_not_generate_cursor_replies() {
+    let mut screen = TerminalScreen::new();
+    assert!(
+        screen
+            .process(b"text [6n\x1b[?6n\x1b[5n\x1b[6;1n\x1b[6:1n")
+            .is_empty()
+    );
+    screen.parser.set_size(16, 40);
+    assert_eq!(screen.process(b"\x1b[16;40H\x1b[6n"), b"\x1b[16;40R");
+}
+
+#[test]
+fn watchdog_exits_with_diagnostics_even_when_cleanup_blocks() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = directory.path().join("watchdog.log");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "watchdog_blocked_cleanup_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Watchdog failed to bound the blocked fixture");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let log = std::fs::read_to_string(log).unwrap();
+    assert_eq!(status.code(), Some(124), "{log}");
+    assert!(
+        log.contains("exceeded during controlled cleanup stall"),
+        "{log}"
+    );
+    assert!(
+        log.contains("attempting controlled child termination"),
+        "{log}"
+    );
+}
+
+#[test]
+#[ignore = "subprocess fixture for the hard-deadline regression"]
+fn watchdog_blocked_cleanup_fixture() {
+    #[derive(Debug)]
+    struct StuckKiller;
+
+    impl ChildKiller for StuckKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            let _ = writeln!(std::io::stderr(), "attempting controlled child termination");
+            loop {
+                thread::park();
+            }
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(Self)
+        }
+    }
+
+    let watchdog = Watchdog::start(Duration::from_millis(150));
+    watchdog
+        .events
+        .send(WatchEvent::Child(Box::new(StuckKiller)))
+        .unwrap();
+    stage(&watchdog.events, "controlled cleanup stall");
+    loop {
+        thread::park();
+    }
+}
+
+#[test]
 fn real_terminal_handles_history_readers_resize_and_streaming() {
+    let stream_seconds = std::env::var("LOWDOWN_TEST_STREAM_SECONDS")
+        .map(|s| {
+            s.parse::<u64>()
+                .expect("LOWDOWN_TEST_STREAM_SECONDS must be an integer")
+        })
+        .unwrap_or(0);
+    assert!(
+        stream_seconds <= 600,
+        "Streaming check is capped at ten minutes"
+    );
+    // Declared first so the deadline also covers Terminal::drop on panic.
+    let watchdog = Watchdog::start(Duration::from_secs(120 + stream_seconds));
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("rollout.jsonl");
     let mut file = File::create(&path).unwrap();
@@ -214,8 +474,11 @@ fn real_terminal_handles_history_readers_resize_and_streaming() {
     drop(file);
 
     let start = Instant::now();
-    let mut terminal = Terminal::open(&path, &directory.path().join("cache"));
-    println!("Terminal child PID: {:?}", terminal.child.process_id());
+    let mut terminal = Terminal::open(&path, &directory.path().join("cache"), &watchdog);
+    println!(
+        "Terminal child PID: {:?}",
+        terminal.child.as_ref().unwrap().process_id()
+    );
     let initial = terminal.until("first paint", |s| {
         selected(s, "UPDATE119") && s.contains("30/30") && s.contains("Final answer ready.")
     });
@@ -257,10 +520,14 @@ fn real_terminal_handles_history_readers_resize_and_streaming() {
     terminal.resize(16, 40);
     terminal.until("small resize", |s| {
         s.lines().next().is_some_and(|l| l.chars().count() == 40)
+            && s.lines().count() == 16
+            && s.lines().last().is_some_and(|l| l.contains("o expand"))
     });
     terminal.resize(32, 100);
     terminal.until("large resize", |s| {
         s.lines().next().is_some_and(|l| l.chars().count() == 100)
+            && s.lines().count() == 32
+            && s.lines().last().is_some_and(|l| l.contains("o expand"))
     });
     for count in [60, 90, 120] {
         terminal.send(b"\x1b[5~\x1b[5~\x1b[5~\x1b[5~\x1b[5~\x1b[5~");
@@ -275,16 +542,6 @@ fn real_terminal_handles_history_readers_resize_and_streaming() {
 
     let mut file = OpenOptions::new().append(true).open(&path).unwrap();
     let streaming = Instant::now();
-    let stream_seconds = std::env::var("LOWDOWN_TEST_STREAM_SECONDS")
-        .map(|s| {
-            s.parse::<u64>()
-                .expect("LOWDOWN_TEST_STREAM_SECONDS must be an integer")
-        })
-        .unwrap_or(0);
-    assert!(
-        stream_seconds <= 600,
-        "Streaming check is capped at ten minutes"
-    );
     let mut index = 120;
     while index < 132 || streaming.elapsed() < Duration::from_secs(stream_seconds) {
         let appended = Instant::now();
