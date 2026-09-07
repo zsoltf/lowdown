@@ -123,6 +123,16 @@ impl TerminalScreen {
         }
         replies
     }
+
+    fn visible_text(&self) -> String {
+        let screen = self.parser.screen();
+        // contents() joins soft-wrapped rows for copy/paste. UI assertions
+        // need physical screen rows, regardless of how ConPTY emitted them.
+        screen
+            .rows(0, screen.size().1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -218,7 +228,7 @@ impl Terminal {
         let deadline = Instant::now() + TIMEOUT;
         loop {
             self.pump();
-            let screen = self.screen.lock().unwrap().parser.screen().contents();
+            let screen = self.screen.lock().unwrap().visible_text();
             if predicate(&screen) {
                 return screen;
             }
@@ -336,6 +346,31 @@ fn loaded(screen: &str) -> usize {
         .lines()
         .find_map(|line| line.split(" | ").nth(1)?.split('/').nth(1)?.parse().ok())
         .unwrap_or(0)
+}
+
+#[test]
+fn screen_assertions_preserve_physical_rows_after_soft_wraps() {
+    for explicit_positioning in [false, true] {
+        let mut screen = TerminalScreen::new();
+        // Full-width rows can be emitted without newlines by a terminal host.
+        for (row, text) in [
+            "Selected update",
+            "UPDATE119 Original text",
+            "12:00 | 30/30 | LIVE",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if explicit_positioning {
+                screen.process(format!("\x1b[{};1H", row + 1).as_bytes());
+            }
+            screen.process(format!("{text:<100}").as_bytes());
+        }
+        assert_eq!(screen.parser.screen().row_wrapped(0), !explicit_positioning);
+        let text = screen.visible_text();
+        assert!(selected(&text, "UPDATE119"), "{text:?}");
+        assert_eq!(loaded(&text), 30);
+    }
 }
 
 #[test]
