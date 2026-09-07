@@ -9,6 +9,10 @@ text and latest answer a keypress away.
 Run `lowdown` inside the project you want to follow. No paths or flags to
 remember for everyday use.
 
+![Lowdown showing short progress summaries, the selected original update, and the latest answer preview](docs/images/lowdown-terminal.png)
+
+*Lowdown following its own release work: scan the summaries, then inspect the original.*
+
 ## What You See
 
 - A live update feed that takes most of the screen.
